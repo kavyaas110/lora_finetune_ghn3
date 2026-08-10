@@ -65,7 +65,7 @@ def main():
             '(https://github.com/pytorch/pytorch/issues/659360).'
             'Therefore, this repo is not supporting DataParallel anymore as it complicates some steps. '
             'nn.DistributedDataParallel is used if this script is called with torchrun (see examples on top).')
-    is_imagenet = args.dataset.startswith('imagenet')
+    is_imagenet = (args.dataset.startswith('imagenet') or args.dataset == 'caltech101')
 
     log('loading the %s dataset...' % args.dataset.upper())
     train_queue, _, num_classes = image_loader(args.dataset,

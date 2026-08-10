@@ -49,7 +49,7 @@ def from_pretrained(ghn3_name='ghn3xlm16.pt', **kwargs):
         state_dict = joblib.load(hf_hub_download(repo_id='SamsungSAILMontreal/ghn3', filename=ghn3_name))
     except huggingface_hub.utils.HfHubHTTPError as e:
         print(e, '\nTrying to load from local file...')
-        state_dict = torch.load(ghn3_name, map_location='cpu')
+        state_dict = torch.load(ghn3_name, map_location='cpu', weights_only=False)
         if 'config' in state_dict:
             ghn_config = state_dict['config']
         state_dict = state_dict['state_dict']
@@ -71,7 +71,7 @@ def from_pretrained(ghn3_name='ghn3xlm16.pt', **kwargs):
                 num_classes = len(p)
                 break
 
-        s = 16 if num_classes >= 1000 else 11
+        s = 16 if num_classes >= 102 else 11
 
         for p_name, p in state_dict.items():
             if p_name.endswith('ln.weight'):

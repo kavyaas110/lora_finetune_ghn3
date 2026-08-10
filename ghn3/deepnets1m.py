@@ -147,7 +147,7 @@ class DeepNets1MDDP(DeepNets1M):
             graph.net_idx = idx
             if self.is_train and not self.debug:
                 graph.net = NetworkLight(is_imagenet_input=self.large_images,
-                                         num_classes=1000 if self.large_images else 10,
+                                         num_classes=102 if self.large_images else 10,
                                          **net_args)
 
         return graph
