@@ -12,6 +12,7 @@ Helper to train models.
 
 import os
 import math
+# import time
 import torch
 import torch.nn as nn
 import numpy as np
@@ -65,6 +66,7 @@ class Trainer:
                  mixup=False,
                  compile_mode=None,
                  beta=1e-5,  # to add noise to predicted parameters to improve their fine-tuning
+                 lora=False
                  ):
 
         if bce:
@@ -83,6 +85,7 @@ class Trainer:
         self.predparam_wd = predparam_wd
         self.epochs = epochs
         self.verbose = verbose
+        self.lora = lora
         if self.amp:
             self.scaler = torch.cuda.amp.GradScaler(growth_interval=amp_growth_interval)
         self.ddp = is_ddp()
@@ -159,6 +162,10 @@ class Trainer:
     def _reset(self, opt, opt_args, scheduler, scheduler_args, state_dict):
 
         assert 'lr' in opt_args, 'learning rate must be specified in opt_args'
+
+        # Preserve the original opt_args because the scheduler uses opt_args["lr"].
+        optimizer_args = opt_args.copy()
+
         if opt.lower() == 'sgd':
             optimizer = torch.optim.SGD
         else:
@@ -170,10 +177,76 @@ class Trainer:
                 optimizer = Lamb
             else:
                 raise NotImplementedError(opt)
+
             if 'momentum' in opt_args:
                 del opt_args['momentum']
+                if self.lora and 'momentum' in optimizer_args:
+                    del optimizer_args['momentum']
 
-        self._optimizer = optimizer(self._model.parameters(), **opt_args)
+        if self.lora:
+            lora_params = []
+            class_head_params = []
+            other_trainable_params = []
+
+            for name, param in self._model.named_parameters():
+                if not param.requires_grad:
+                    continue
+
+                if "lora_A" in name or "lora_B" in name:
+                    lora_params.append(param)
+                elif "class_layer_predictor" in name or "bias_class" in name:
+                    class_head_params.append(param)
+                else:
+                    # This helps detect parameters that were accidentally left trainable.
+                    other_trainable_params.append((name, param))
+
+            if other_trainable_params:
+                log("WARNING: trainable parameters found outside LoRA and class heads:")
+                for name, param in other_trainable_params:
+                    log(f"  {name}: {tuple(param.shape)}")
+
+            if len(lora_params) == 0:
+                raise RuntimeError("No trainable LoRA parameters were found.")
+
+            if len(class_head_params) == 0:
+                raise RuntimeError("No trainable class-head parameters were found.")
+
+            base_lr = opt_args["lr"]
+            class_head_lr = base_lr * 0.02
+
+            parameter_groups = [
+                {
+                    "params": lora_params,
+                    "lr": base_lr,
+                    "name": "lora",
+                },
+                {
+                    "params": class_head_params,
+                    "lr": class_head_lr,
+                    "name": "class_heads",
+                },
+            ]
+
+            # Each parameter group already specifies its own learning rate.
+            # Remove lr only from the copy passed to the optimizer.
+            optimizer_args.pop("lr")
+
+            self._optimizer = optimizer(parameter_groups, **optimizer_args)
+
+            log(
+                f"Optimizer parameter groups: "
+                f"LoRA={sum(p.numel() for p in lora_params):,} params, "
+                f"lr={base_lr:.6e}; "
+                f"class heads={sum(p.numel() for p in class_head_params):,} params, "
+                f"lr={class_head_lr:.6e}"
+            )
+        else:
+            trainable_params = [p for p in self._model.parameters() if p.requires_grad]
+
+            if len(trainable_params) == 0:
+                log("WARNING: no trainable GHN parameters found.")
+            self._optimizer = optimizer(trainable_params, **opt_args)
+
 
         if scheduler.startswith('cosine-warmup'):
 
@@ -208,6 +281,7 @@ class Trainer:
             raise NotImplementedError(scheduler)
 
         if state_dict is not None and 'optimizer' in state_dict:
+            log("In state_dict if condition, found optimizer state. Loading it.")
             if self.verbose:
                 print('loading optimizer state')
             self._optimizer.load_state_dict(state_dict['optimizer'])
@@ -350,6 +424,55 @@ class Trainer:
             else:
                 loss.backward()
 
+                # def grad_norm(parameters):
+                #     total_squared = 0.0
+                #     found_grad = False
+                #
+                #     for param in parameters:
+                #         if param.grad is None:
+                #             continue
+                #
+                #         found_grad = True
+                #         norm = param.grad.detach().float().norm(2).item()
+                #         total_squared += norm ** 2
+                #
+                #     return total_squared ** 0.5 if found_grad else 0.0
+                #
+                # head_lora_params = []
+                # other_lora_params = []
+                #
+                # for name, param in self._model.named_parameters():
+                #     if not param.requires_grad:
+                #         continue
+                #
+                #     if "lora_A" not in name and "lora_B" not in name:
+                #         continue
+                #
+                #     if (
+                #             "class_layer_predictor" in name
+                #             or "bias_class" in name
+                #     ):
+                #         head_lora_params.append(param)
+                #     else:
+                #         other_lora_params.append(param)
+                #
+                # if self._step % 50 == 0:
+                #     head_grad_norm = grad_norm(head_lora_params)
+                #     other_grad_norm = grad_norm(other_lora_params)
+                #
+                #     print(
+                #         f"LoRA gradient norms: "
+                #         f"head={head_grad_norm:.6e}, "
+                #         f"other={other_grad_norm:.6e}"
+                #     )
+
+            if self._step == 0 and self.verbose:
+                model_to_check = self._model.module if hasattr(self._model, "module") else self._model
+                for name, p in model_to_check.named_parameters():
+                    if p.requires_grad:
+                        log(f"GRAD CHECK {name}: grad_is_none={p.grad is None}")
+                        break
+
             if self._step == 0 and self.rank == 0 and self.verbose:
                 print_grads(self._model)
 
@@ -378,7 +501,17 @@ class Trainer:
                     if scale < self.amp_min_scale:
                         self.scaler._scale = torch.tensor(self.amp_min_scale).to(scale)
             else:
+                # torch.cuda.synchronize()
+                # optimizer_start = time.perf_counter()
                 self._optimizer.step()
+                # torch.cuda.synchronize()
+                # optimizer_time = time.perf_counter() - optimizer_start
+
+                # if self._step < 5:
+                #     print(
+                #         f"batch={self._step}, "
+                #         f"optimizer_step_time={optimizer_time:.6f}s"
+                #     )
 
             targets = targets_one_hot.view(1, -1).expand(len(logits), -1).reshape(-1)
             logits = logits.reshape(-1, logits.shape[-1])
@@ -439,3 +572,6 @@ class Trainer:
             if self.amp:
                 metrics['amp_scale'] = self.scaler._check_scale_growth_tracker('update')[0].item()
             self.logger(step_, metrics)
+
+    def get_metrics(self):
+        return {metric: value.avg for metric, value in self.metrics.items()}

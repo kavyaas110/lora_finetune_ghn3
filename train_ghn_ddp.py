@@ -34,14 +34,34 @@ Example:
 
 
 import argparse
+import csv
+import os
 import time
 from functools import partial
 from ppuda.config import init_config
 from ppuda.vision.loader import image_loader
-from ghn3 import GHN3, log, Trainer, DeepNets1MDDP, setup_ddp, clean_ddp
+from ghn3 import GHN3, log, Trainer, DeepNets1MDDP, setup_ddp, clean_ddp, from_pretrained
+from ghn3.lora_utils import apply_lora_to_ghn, freeze_except_lora_and_classifier, print_trainable_params
 
 log = partial(log, flush=True)
 
+def append_epoch_metrics(csv_path, row, fieldnames):
+    """
+    Append one epoch's results to a CSV file.
+
+    The header is written automatically when the file does not exist.
+    """
+    os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+
+    file_exists = os.path.exists(csv_path)
+
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+
+        if not file_exists:
+            writer.writeheader()
+
+        writer.writerow(row)
 
 def main():
     parser = argparse.ArgumentParser(description='GHN-3 training')
@@ -50,6 +70,16 @@ def main():
     parser.add_argument('--ghn2', action='store_true', help='train GHN-2, also can use code from'
                                                             ' https://github.com/facebookresearch/ppuda to train GHN-2')
     parser.add_argument('--interm_epoch', type=int, default=5, help='intermediate epochs to keep checkpoints for')
+
+    # Adding some arguments to parser to support LoRA fine tuning
+    parser.add_argument('--freeze-ghn', action='store_true',
+                        help='freeze all GHN parameters for sanity check')
+    parser.add_argument('--lora', action='store_true',
+                        help='enable LoRA fine-tuning')
+    parser.add_argument('--lora-r', type=int, default=8)
+    parser.add_argument('--lora-alpha', type=int, default=16)
+    parser.add_argument('--lora-dropout', type=float, default=0.05)
+
     ghn2 = parser.parse_known_args()[0].ghn2
 
     ddp = setup_ddp()
@@ -88,7 +118,62 @@ def main():
               'decoder': args.decoder, 'weight_norm': args.weight_norm, 've': args.virtual_edges > 1,
               'layernorm': args.ln, 'hid': hid, 'layers': args.layers, 'heads': args.heads, 'is_ghn2': ghn2}
 
-    ghn = GHN3(**config, debug_level=args.debug)
+    log("Number of classes: ",num_classes)
+
+    # Inside trainer the checkpoint is loaded with an expectation that the model is an image classification model.
+    # So when it goes into the ckpt route of using from pretrained, it will also predict weights for the model. But my goal
+    # is to do ghn3 training, so I don't want to predict ghn3 weights using ghn3. Also doing so causes a runtime error.
+    # So the following code is in place to load the pretrained model weights and then continue training or lora finetuning.
+    if args.ckpt is not None:
+        log(f'Loading ImageNet-pretrained GHN from {args.ckpt}')
+
+        pretrained_ghn = from_pretrained(args.ckpt,debug_level=1)
+
+        ghn = GHN3(**config, debug_level=args.debug)
+
+        model_sd = ghn.state_dict()
+        pretrained_sd = pretrained_ghn.state_dict()
+
+        filtered_sd = {k: v for k, v in pretrained_sd.items() if k in model_sd and v.shape == model_sd[k].shape}
+
+        skipped = {k: (v.shape, model_sd[k].shape) for k, v in pretrained_sd.items() if k in model_sd and v.shape != model_sd[k].shape}
+
+        model_sd.update(filtered_sd)
+        missing, unexpected = ghn.load_state_dict(model_sd, strict=False)
+
+        log(f'Loaded compatible ImageNet GHN weights from {args.ckpt}.')
+        log(f'Loaded keys: {len(filtered_sd)} / {len(model_sd)}')
+        log('Skipped shape-mismatched ImageNet keys:')
+        for k, shapes in skipped.items():
+            log(f'{k}: ckpt {shapes[0]} vs model {shapes[1]}')
+        log(f'Missing keys: {missing}')
+        log(f'Unexpected keys: {unexpected}')
+    else:
+        ghn = GHN3(**config, debug_level=args.debug)
+
+    if args.lora:
+        log("Applying LoRA to GHN.")
+
+        ghn, replaced_layers = apply_lora_to_ghn(
+            ghn,
+            r=args.lora_r,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+        )
+
+        log("LoRA replaced Linear layers:")
+        for layer_name in replaced_layers:
+            log(f"  {layer_name}")
+
+        ghn = freeze_except_lora_and_classifier(ghn)
+
+    elif args.freeze_ghn:
+        log("Freezing all GHN parameters.")
+        for p in ghn.parameters():
+            p.requires_grad = False
+
+    num_trainable, num_total_param, trainable_pct = print_trainable_params(ghn, log_fn=log)
+
     graphs_queue, sampler = DeepNets1MDDP.loader(args.meta_batch_size // (ddp.world_size if ddp.ddp else 1),
                                                  dense=ghn.is_dense(),
                                                  wider_nets=is_imagenet,
@@ -100,6 +185,7 @@ def main():
                                                  verbose=ddp.rank == 0,
                                                  debug=args.debug > 0)
 
+    # For my purposes, I handle ckpt argument in my code above, so I don't want the trainer to handle it. So I set it to None here.
     trainer = Trainer(ghn,
                       opt=args.opt,
                       opt_args={'lr': args.lr, 'weight_decay': args.wd, 'momentum': args.momentum},
@@ -115,10 +201,11 @@ def main():
                       predparam_wd=0 if ghn2 else 3e-5,
                       label_smoothing=0.1 if is_imagenet else 0.0,
                       save_dir=args.save,
-                      ckpt=args.ckpt,
+                      ckpt=None,
                       epochs=args.epochs,
                       verbose=ddp.rank == 0,
-                      compile_mode=args.compile)
+                      compile_mode=args.compile,
+                      lora=args.lora)
 
     log('\nStarting training GHN with {} parameters!'.format(sum([p.numel() for p in ghn.parameters()])))
     if ddp.ddp:
@@ -129,7 +216,34 @@ def main():
 
     graphs_queue = iter(graphs_queue)
 
+    metrics_dir = os.path.join(args.save, "metrics")
+    os.makedirs(metrics_dir, exist_ok=True)
+
+    metrics_csv = os.path.join(
+        metrics_dir,
+        f"{args.name}_metrics.csv"
+    )
+
+    metric_fields = ["epoch", "train_loss", "train_top1", "train_top5", "time_per_epoch", "learning_rate", "trainable_params",
+                     "total_params", "trainable_percent", "batch_size", "meta_batch_size", "weight_decay", "seed", "lora_r",
+                     "lora_alpha", "lora_dropout"]
+
+    row = {
+        "learning_rate": args.lr,
+        "trainable_params": num_trainable,
+        "total_params": num_total_param,
+        "trainable_percent": trainable_pct,
+        "batch_size": args.batch_size,
+        "meta_batch_size": args.meta_batch_size,
+        "weight_decay": args.wd,
+        "seed": args.seed,
+        "lora_r": args.lora_r if args.lora else "",
+        "lora_alpha": args.lora_alpha if args.lora else "",
+        "lora_dropout": args.lora_dropout if args.lora else "",
+    }
+
     for epoch in range(trainer.start_epoch, args.epochs):
+        epoch_start = time.perf_counter()
 
         log('\nepoch={:03d}/{:03d}, lr={:e}'.format(epoch + 1, args.epochs, trainer.get_lr()))
 
@@ -142,12 +256,22 @@ def main():
 
             trainer.update(images, targets, graphs=next(graphs_queue))
             trainer.log(step)
-
             if args.save:
                 # save GHN checkpoint
                 trainer.save(epoch, step, {'args': args, 'config': config}, interm_epoch=args.interm_epoch)
 
+        epoch_metrics = trainer.get_metrics()
         trainer.scheduler_step()  # lr scheduler step
+        epoch_time = time.perf_counter() - epoch_start
+        metrics = {
+            "epoch": epoch+1,
+            "train_loss": epoch_metrics['loss'],
+            "train_top1": epoch_metrics['top1'],
+            "train_top5": epoch_metrics['top5'],
+            "time_per_epoch": epoch_time
+        }
+        row.update(metrics)
+        append_epoch_metrics(metrics_csv, row, metric_fields)
 
     log('done at {}!'.format(time.strftime('%Y%m%d-%H%M%S')))
     if ddp.ddp:
