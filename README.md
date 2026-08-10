@@ -1,121 +1,237 @@
+# GHN-3 LoRA: Parameter-Efficient Fine-Tuning for New Datasets
 
-# Can We Scale Transformers to Predict Parameters of Diverse ImageNet Models?
+This repository extends the original **GHN-3** implementation with support for parameter-efficient fine-tuning using **Low-Rank Adaptation (LoRA)** and training on the **Caltech-101** dataset.
 
-**ICML 2023 [`link to the poster, slides and video presentation`](https://icml.cc/virtual/2023/poster/24569)**, [`tweet`](https://twitter.com/BorisAKnyazev/status/1633443437851598852)
+The goal of this project is to investigate whether a pretrained GHN-3 can be adapted to a new image classification dataset using LoRA instead of retraining the entire model. The implementation and evaluation are based on the work presented in my RIT Master's Capstone.
 
-[Boris Knyazev](http://bknyaz.github.io/), [Doha Hwang](https://mila.quebec/en/person/doha-hwang/), [Simon Lacoste-Julien](http://www.iro.umontreal.ca/~slacoste/)
+## Features
 
-Paper: https://arxiv.org/abs/2303.04143, https://openreview.net/forum?id=7UXf8dAz5T
+- LoRA integration for GHN-3
+- Support for Caltech-101 dataset in GHN-3 training
+- Loading ImageNet-pretrained GHN-3 checkpoints with selective weight initialization
+- Full retraining and LoRA fine-tuning pipelines
 
-# Introduction
+## Repository Modifications
 
-**Updates**
+### GHN-3
 
-- [July 11, 2023] Sync changes with the recent [PPUDA/GHN-2](https://github.com/facebookresearch/ppuda/) updates, 
-  - [timm](https://github.com/huggingface/pytorch-image-models) training recipes added from [ResNet strikes back](https://arxiv.org/abs/2110.00476)
-  - Video presentation of our paper is now available at [this link](https://recorder-v3.slideslive.com/?share=82913&s=2547b532-e0e2-462b-9312-4ab3dd1fa72a)
-- [June 26, 2023] Training and eval on CIFAR-10 and eval on the DeepNets splits are supported.
-- [June 22, 2023] Major code refactoring. 
-  - Distributed (DDP) training and eval scripts added (see [Experiments](#experiments) below).
-- [June 6, 2023] GHN-3 code improved (see [ghn3/nn.py](ghn3/nn.py)), more examples added (see [ghn_single_model.py](examples/ghn_single_model.py)).
-- [Apr 11, 2023] Cleaned up graph construction, sanity check for all PyTorch models.
-- [Apr 4, 2023] Slightly updated graph construction for ViT to be consistent with our paper. 
-  - Made four variants of our GHN-3 available: `ghn3tm8, ghn3sm8, ghn3lm8, ghn3xlm16` (see updated [ghn_all_pytorch.ipynb](examples/ghn_all_pytorch.ipynb)). `ghn3tm8` takes just 27MB so it is efficient to use in low-memory cases.
- 
+The following capabilities were added to the original GHN-3 implementation:
 
-This work extends the previous work [`Parameter Prediction for Unseen Deep Architectures`](https://github.com/facebookresearch/ppuda/) that introduced improved Graph HyperNetworks (GHN-2).
-Here, we scale up GHN-2 and release our best performing model `GHN-3-XL/m16` as well as smaller variants. 
-Our GHN-3 can be used as a good initialization for many large ImageNet models. 
+- Integrated LoRA into selected linear layers of the Graphormer backbone and decoder.
+- Parameterized the classifier prediction heads to support arbitrary numbers of output classes.
+- Added selective checkpoint loading for layers whose dimensions differ from pretrained ImageNet weights.
+- Added training and evaluation support for LoRA fine-tuning on Caltech-101.
 
-Below are a few figures showcasing our results (see [our paper](https://arxiv.org/abs/2303.04143) for details).
+### PPUDA
 
+GHN-3 depends on the **PPUDA** library for dataset loading and graph construction. To support Caltech-101, two modifications are required in PPUDA.
 
-<figure> <img src="figs/fig1.png" height="380"></figure>
-
-<figure> <img src="figs/fig4.png" height="160"></figure>
-
-<figure> <img src="figs/fig6.png" height="150"></figure>
-
-
-Our code has only a few dependencies and is easy to use as shown below with PyTorch examples.
-
-Please feel free to open a GitHub issue to ask questions or report bugs. 
-Pull requests are also welcome.
-
-# Installation
-
-```
-# If you didn't install ppuda before:
-pip install git+https://github.com/facebookresearch/ppuda.git
-
-# If you had ppuda installed before, you need to reinstall it, because it was updated recently:
-pip install git+https://github.com/facebookresearch/ppuda.git --no-deps --upgrade --force-reinstall
-
-pip install torch>=1.12.1 torchvision>=0.13.1  # [optional] update torch in case it's old
-
-pip install huggingface_hub joblib # to load pretrained GHNs
-
-pip install timm  # [optional] to use fancy optimizers like LAMB
+#### 1.  The following modification is required in `ppuda/vision/loader.py`. Replace the `image_loader` function with the following code:
 
 ```
 
-# Imagenet
+def image_loader(dataset='imagenet', data_dir='./data/', test=True, im_size=32,
+                 batch_size=64, test_batch_size=64, num_workers=0,
+                 cutout=False, cutout_length=16, noise=False,
+                 seed=1111, load_train_anyway=False, n_shots=None, ddp=False, transforms_train_val=None, verbose=True):
+    """
 
-For training and evaluation on ImageNet, one needs to setup 
-ImageNet as in [scripts/imagenet_setup.sh](scripts/imagenet_setup.sh).
+    :param dataset: image dataset: imagenet, cifar10, cifar100, etc.
+    :param data_dir: location of the dataset
+    :param test: True to load the test data for evaluation, False to load the validation data.
+    :param im_size: image size for CIFAR data (ignored for dataset='imagenet')
+    :param batch_size: training batch size of images
+    :param test_batch_size: evaluation batch size of images
+    :param num_workers: number of threads to load/preprocess images
+    :param cutout: use Cutout for data augmentation from
+                   "Terrance DeVries, Graham W. Taylor. Improved Regularization of Convolutional Neural Networks with Cutout. 2017."
+    :param cutout_length: Cutout hyperparameter
+    :param noise: evaluate on the images with added Gaussian noise
+    :param seed: random seed to shuffle validation images on ImageNet
+    :param load_train_anyway: load training images even when evaluating on test data (test=True)
+    :param n_shots: the number of training images per class (only for CIFAR-10 and other torchvision datasets and when test=True)
+    :param ddp: True to use DistributedDataParallel
+    :param transforms_train_val: custom transforms for training and validation images
+    :param verbose: True to print the information about the dataset
+    :return: training and evaluation torch DataLoaders and number of classes in the dataset
+    """
+    train_data = None
 
-**Training and evaluation on CIFAR-10 is now also supported, however, it was not presented in the paper.**
+    if dataset.lower() == 'imagenet':
+        if transforms_train_val is None:
+            transforms_train_val = transforms_imagenet(noise=noise, cifar_style=False, im_size=im_size)
+        train_transform, valid_transform = transforms_train_val
 
-# Usage
+        imagenet_dir = os.path.join(data_dir, 'imagenet')
+
+        if not test or load_train_anyway:
+            train_data = ImageNetDataset(imagenet_dir, 'train', transform=train_transform, has_validation=not test)
+
+        valid_data = ImageNetDataset(imagenet_dir, 'val', transform=valid_transform, has_validation=not test)
+
+        shuffle_val = True  # to eval models with batch norm in the training mode (in case of no running statistics)
+        n_classes = len(valid_data.classes)
+        generator = torch.Generator()
+        generator.manual_seed(seed)  # to reproduce evaluation with shuffle=True on ImageNet
+
+    elif dataset.lower() == 'caltech101':
+
+        if transforms_train_val is None:
+            transforms_train_val = transforms_imagenet(
+                noise=noise,
+                cifar_style=False,
+                im_size=im_size
+            )
+
+        train_transform, valid_transform = transforms_train_val
+
+        caltech_dir = os.path.join(data_dir, 'caltech101')
+
+        if not test or load_train_anyway:
+            train_data = ImageFolder(
+                os.path.join(caltech_dir, 'train'),
+                transform=train_transform
+            )
+
+        valid_data = ImageFolder(
+            os.path.join(caltech_dir, 'val'),
+            transform=valid_transform
+        )
+
+        shuffle_val = False
+        n_classes = len(train_data.classes)
+        generator = None
+
+        if train_data is not None:
+            train_data.num_examples = len(train_data)
+            train_data.checksum = 0.0
+
+        valid_data.num_examples = len(valid_data)
+        valid_data.checksum = 0
+    else:
+        dataset = dataset.upper()
+        if transforms_train_val is None:
+            transforms_train_val = transforms_cifar(cutout=cutout, cutout_length=cutout_length, noise=noise, sz=im_size)
+        train_transform, valid_transform = transforms_train_val
+
+        if test:
+            valid_data = eval('{}(data_dir, train=False, download=True, transform=valid_transform)'.format(dataset))
+            if load_train_anyway:
+                train_data = eval('{}(data_dir, train=True, download=True, transform=train_transform)'.format(dataset))
+                if n_shots is not None:
+                    train_data = to_few_shot(train_data, n_shots=n_shots)
+        else:
+            if n_shots is not None and verbose:
+                print('few shot regime is only supported for evaluation on the test data')
+            # Held out 10% (e.g. 5000 images in case of CIFAR-10) of training data as the validation set
+            train_data = eval('{}(data_dir, train=True, download=True, transform=train_transform)'.format(dataset))
+            valid_data = eval('{}(data_dir, train=True, download=True, transform=valid_transform)'.format(dataset))
+            n_all = len(train_data.targets)
+            n_val = n_all // 10
+            idx_train, idx_val = torch.split(torch.arange(n_all), [n_all - n_val, n_val])
+
+            train_data.data = train_data.data[idx_train]
+            train_data.targets = [train_data.targets[i] for i in idx_train]
+
+            valid_data.data = valid_data.data[idx_val]
+            valid_data.targets = [valid_data.targets[i] for i in idx_val]
+
+            if n_shots is not None:
+                train_data = to_few_shot(train_data, n_shots=n_shots)
+
+        if train_data is not None:
+            train_data.checksum = train_data.data.mean()
+            train_data.num_examples = len(train_data.targets)
+
+        shuffle_val = False
+        n_classes = len(torch.unique(torch.tensor(valid_data.targets)))
+        generator = None
+
+        valid_data.checksum = valid_data.data.mean()
+        valid_data.num_examples = len(valid_data.targets)
+
+    if verbose:
+        print('loaded {}: {} classes, {} train samples (checksum={}), '
+              '{} {} samples (checksum={:.3f})'.format(dataset,
+                                                       n_classes,
+                                                       train_data.num_examples if train_data else 'none',
+                                                       ('%.3f' % train_data.checksum) if train_data else 'none',
+                                                       valid_data.num_examples,
+                                                       'test' if test else 'val',
+                                                       valid_data.checksum))
+
+    if train_data is None:
+        train_loader = None
+    else:
+        sampler = DistributedSampler(train_data) if ddp else None
+        train_loader = DataLoader(train_data,
+                                  batch_size=batch_size,
+                                  shuffle=sampler is None,
+                                  sampler=sampler,
+                                  pin_memory=True,
+                                  num_workers=num_workers)
+
+    valid_loader = DataLoader(valid_data, batch_size=test_batch_size, shuffle=shuffle_val,
+                              pin_memory=True, num_workers=num_workers, generator=generator)
+
+    return train_loader, valid_loader, n_classes
+```
+
+#### 2. `ppuda/deepnets1m/loader.py` line 247
+
+GHN-3 constructs target network graphs using the number of output classes specified in `DeepNets1M`. Since the original implementation assumes ImageNet-sized outputs for large images, this value was changed for Caltech-101.
+
+Replace:
+
+```python
+num_classes = 1000 if self.large_images else 10
+```
+
+with:
+
+```python
+num_classes = 102 if self.large_images else 10
+
+> **Note**
+>
+> This repository assumes the corresponding PPUDA modifications have also been applied. Those changes are maintained separately since PPUDA is an external dependency.
+
+## Results
+
+Compared to conventional full retraining on Caltech-101:
+
+- Reduced trainable parameters from **100%** to **15.14%**
+- Approximately **9% reduction** in training time
+- LoRA converged faster during training
+- Final Top-1 accuracy remained approximately **5–6%** below full retraining while requiring substantially fewer trainable parameters. 
+
+## Installation
+
+1. Clone this repository.
+
+```bash
+git clone https://github.com/<your-username>/<repo>.git
+cd <repo>
+```
+
+2. Follow the installation instructions provided in the original GHN-3 repository to set up the environment and install all dependencies.
+
+3. Apply the required modifications to `ppuda/vision/loader.py` described in the **PPUDA Dependency** section.
+
+## Citation
+
+If you use this implementation in your work, please cite:
 
 ```
-import torchvision
-from ghn3 import from_pretrained
-
-ghn = from_pretrained()  # default is 'ghn3xlm16.pt', other variants are: 'ghn3tm8.pt', 'ghn3sm8.pt', 'ghn3lm8.pt'
-
-model = torchvision.models.resnet50()  # can be any torchvision model
-model = ghn(model)
-
-# That's it, the ResNet-50 is initialized with our GHN-3.
+Kavyaa Sheth.
+Finetuning Graph HyperNetwork (GHN) Using Low-Rank Adaptation (LoRA).
+Master's Capstone, Rochester Institute of Technology, 2026.
 ```
 
+## Acknowledgements
 
-GHN-3 is stored in HuggingFace at 
-https://huggingface.co/SamsungSAILMontreal/ghn3/tree/main.
-As the largest model (`ghn3xlm16.pt`) takes about 2.5GB, 
-it takes a while to download the model during 
-the first call of `ghn = from_pretrained()`.
+This project builds upon:
 
-See [ghn_single_model.py](examples/ghn_single_model.py) for the examples of fine-tuning the model or GHN.
-Also see [ghn_all_pytorch.ipynb](examples/ghn_all_pytorch.ipynb) where we show how to predict parameters for all PyTorch models.
-
-# Experiments
-
-These scripts allow for training and evaluation of PyTorch models and GHN-3 and comparing to the baselines as in our paper.
-Training will be automatically run using `DistributedDataParallel` on all GPUs available if the script is run using `torchrun`.
-See command examples in [train_ghn_ddp.py](train_ghn_ddp.py) and [train_ddp.py](train_ddp.py).
-
-- For training GHN-3 see commands in [train_ghn_ddp.py](train_ghn_ddp.py).
-- For evaluating GHN-3 see commands in [eval_ghn.py](eval_ghn.py) (make sure to use `--split torch` for evaluation on PyTorch).
-- For training PyTorch models with and without GHN-3 initialization see commands in [train_ddp.py](train_ddp.py).
-- For evaluating PyTorch models see commands in [eval.py](eval.py).
-
-# License
-
-This code is licensed under [MIT license](LICENSE) and is based on
-https://github.com/facebookresearch/ppuda that is also licensed under [MIT license](https://github.com/facebookresearch/ppuda/blob/main/LICENSE).
-
-# Citation
-
-```
-@inproceedings{knyazev2023canwescale,
-  title={Can We Scale Transformers to Predict Parameters of Diverse ImageNet Models?},
-  author={Knyazev, Boris and Hwang, Doha and Lacoste-Julien, Simon},
-  booktitle={International Conference on Machine Learning},
-  year={2023}
-}
-```
-
-
-
+- GHN-3: *Can We Scale Transformers to Predict Parameters of Diverse ImageNet Models?*
+- PPUDA by Meta AI Research
+- LoRA: *Low-Rank Adaptation of Large Language Models*
