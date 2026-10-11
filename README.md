@@ -33,11 +33,11 @@ Compared to conventional full retraining on Caltech-101:
 
 **Top-1 accuracy per epoch**
 
-![Training Top-1 accuracy per epoch comparing full GHN-3 retraining and LoRA fine-tuning](Results/train_top1_comparison.png)
+![Training Top-1 accuracy per epoch comparing full GHN-3 retraining and LoRA fine-tuning](results/train_top1_comparison.png)
 
 **Top-5 accuracy per epoch**
 
-![Training Top-5 accuracy per epoch comparing full GHN-3 retraining and LoRA fine-tuning](Results/train_top5_comparison.png)
+![Training Top-5 accuracy per epoch comparing full GHN-3 retraining and LoRA fine-tuning](results/train_top5_comparison.png)
 
 ## Conclusion
 
