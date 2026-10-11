@@ -11,6 +11,45 @@ The goal of this project is to investigate whether a pretrained GHN-3 can be ada
 - Loading ImageNet-pretrained GHN-3 checkpoints with selective weight initialization
 - Full retraining and LoRA fine-tuning pipelines
 
+## Results
+
+Compared to conventional full retraining on Caltech-101:
+
+| Model                 | Total Parameters | Trainable Parameters |
+| --------------------- | ---------------: | -------------------: |
+| Fully retrained GHN-3 |        7,986,052 |     7,986,052 (100%) |
+| LoRA fine-tuned GHN-3 |        7,986,052 |   1,209,420 (15.14%) |
+
+| Hyperparameter  |  Value |
+| --------------- | -----: |
+| Learning rate   | `5e-5` |
+| Meta batch size |      8 |
+| Batch size      |     32 |
+| LoRA rank       |     16 |
+| LoRA alpha      |     32 |
+| LoRA dropout    |   0.05 |
+
+### Training Accuracy
+
+**Top-1 accuracy per epoch**
+
+![Training Top-1 accuracy per epoch comparing full GHN-3 retraining and LoRA fine-tuning](Results/train_top1_comparison.png)
+
+**Top-5 accuracy per epoch**
+
+![Training Top-5 accuracy per epoch comparing full GHN-3 retraining and LoRA fine-tuning](Results/train_top5_comparison.png)
+
+## Conclusion
+
+This project demonstrates that LoRA can adapt an ImageNet-pretrained GHN-3 to Caltech-101 without updating the full model.
+
+- LoRA reduced trainable parameters from **100%** to **15.14%**
+- Approximately **9% reduction** in training time
+- LoRA converged faster during training
+- Final Top-1 accuracy remained approximately **5–6%** below full retraining while requiring substantially fewer trainable parameters.
+
+These results highlight LoRA as a more resource-efficient adaptation strategy, with a trade-off in predictive performance. Further evaluation on additional datasets and across different GHN-3 components would help determine how broadly this trade-off applies.
+
 ## Repository Modifications
 
 ### GHN-3
@@ -26,7 +65,7 @@ The following capabilities were added to the original GHN-3 implementation:
 
 GHN-3 depends on the **PPUDA** library for dataset loading and graph construction. To support Caltech-101, two modifications are required in PPUDA.
 
-#### 1.  The following modification is required in `ppuda/vision/loader.py`. Replace the `image_loader` function with the following code:
+#### 1. The following modification is required in `ppuda/vision/loader.py`. Replace the `image_loader` function with the following code:
 
 ```
 
@@ -191,19 +230,11 @@ with:
 
 ```python
 num_classes = 102 if self.large_images else 10
+```
 
 > **Note**
 >
 > This repository assumes the corresponding PPUDA modifications have also been applied. Those changes are maintained separately since PPUDA is an external dependency.
-
-## Results
-
-Compared to conventional full retraining on Caltech-101:
-
-- Reduced trainable parameters from **100%** to **15.14%**
-- Approximately **9% reduction** in training time
-- LoRA converged faster during training
-- Final Top-1 accuracy remained approximately **5–6%** below full retraining while requiring substantially fewer trainable parameters. 
 
 ## Installation
 
@@ -232,6 +263,6 @@ Master's Capstone, Rochester Institute of Technology, 2026.
 
 This project builds upon:
 
-- GHN-3: *Can We Scale Transformers to Predict Parameters of Diverse ImageNet Models?*
+- GHN-3: _Can We Scale Transformers to Predict Parameters of Diverse ImageNet Models?_
 - PPUDA by Meta AI Research
-- LoRA: *Low-Rank Adaptation of Large Language Models*
+- LoRA: _Low-Rank Adaptation of Large Language Models_
